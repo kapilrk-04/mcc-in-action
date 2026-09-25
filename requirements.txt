@@ -1,0 +1,9 @@
+numpy
+pandas
+tqdm
+matplotlib
+httpx
+google-genai
+
+# Only needed for executor.py (local inference); vLLM does not support native Windows.
+vllm; sys_platform == "linux"
