@@ -108,7 +108,7 @@ N_TURNS           = 20
 MOVIES_PER_TURN   = 4
 INITIAL_BUDGET    = 10
 BUDGET_FLOOR      = 0
-MIN_MOVIES_NEEDED = 100
+MIN_MOVIES_NEEDED = 80
 
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
@@ -629,7 +629,7 @@ FAKE_TITLES = {"The Matrix", "Gigli", "Inception", "Forrest Gump", "Pulp Fiction
 
 class UserState:
     def __init__(self, user_id, exploit_pool, context_pool, simulator_data,
-                 condition, movie_visibility, run_tag, out_root):
+                 condition, movie_visibility, run_tag, out_root, shuffled_questions):
         self.user_id          = user_id
         self.simulator_data   = simulator_data
         self.condition        = condition
@@ -642,8 +642,7 @@ class UserState:
         self.true_gender     = gender
         self.true_occupation = occupation
 
-        self.shuffled_questions = QUESTIONS[:]
-        random.shuffle(self.shuffled_questions)
+        self.shuffled_questions = shuffled_questions
 
         if condition in CONTEXT_CONDITIONS:
             self.history_movies, self.dominant_genre = select_history_diverse_balanced(
@@ -1034,11 +1033,12 @@ class AblationPool:
         self.already_done     = 0
         self.resumed          = 0
 
+        # Same question orders as executor.py: a fresh seeded stream per
+        # configuration, one draw per eligible user in sorted order, taken
+        # before the resume check so finished users still advance the stream.
+        rng = random.Random(RANDOM_SEED)
+
         for user_id in sorted(df["UserID"].unique().tolist()):
-            summary_path = os.path.join(OUT_ROOT, f"user_{user_id}", self.run_tag, "summary.json")
-            if os.path.exists(summary_path) and not IGNORE_SUMMARY:
-                self.already_done += 1
-                continue
             user_df      = df[df["UserID"] == user_id].reset_index(drop=True)
             exploit_pool = user_df[user_df["pool"] == "exploit"].reset_index(drop=True)
             context_pool = user_df[user_df["pool"] == "context"].reset_index(drop=True)
@@ -1048,9 +1048,18 @@ class AblationPool:
                 self.skipped += 1; continue
             if str(user_id) not in simulator_data and user_id not in simulator_data:
                 self.skipped += 1; continue
+
+            shuffled_questions = QUESTIONS[:]
+            rng.shuffle(shuffled_questions)
+
+            summary_path = os.path.join(OUT_ROOT, f"user_{user_id}", self.run_tag, "summary.json")
+            if os.path.exists(summary_path) and not IGNORE_SUMMARY:
+                self.already_done += 1
+                continue
             state = UserState(
                 user_id, exploit_pool, context_pool, simulator_data,
                 condition, movie_visibility, self.run_tag, OUT_ROOT,
+                shuffled_questions,
             )
             if not RERUN and state.load_checkpoint():
                 self.resumed += 1

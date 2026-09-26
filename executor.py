@@ -101,7 +101,7 @@ N_TURNS          = 20
 MOVIES_PER_TURN  = 4
 INITIAL_BUDGET   = 10
 BUDGET_FLOOR     = 0
-MIN_MOVIES_NEEDED = 100   # users with fewer exploit rows are skipped
+MIN_MOVIES_NEEDED = 80   # users with fewer exploit rows are skipped
 
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
