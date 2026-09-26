@@ -16,11 +16,11 @@ the plain mean of the per-level Exp@5 values e(theta, l), each level counting
 equally.
 
 Panel B -- the Pearson correlations of the per-level rates against context,
-rho_VA and rho_EXP, summarized as Trend Alignment:
+rho_Rate and rho_EXP, summarized as Trend Alignment:
 
-    Align(theta) = 1 - sqrt((1 - rho_VA)^2 + rho_EXP^2) / sqrt(5)  in [0, 1]
+    Align(theta) = 1 - sqrt((1 - rho_Rate)^2 + rho_EXP^2) / sqrt(5) in [0, 1]
 
-rho_VA is high when exploration falls as context grows; rho_EXP is near zero
+rho_Rate is high when exploration falls as context grows; rho_EXP is near zero
 when question quality is not systematically driven by context. Both live on
 [-1, 1], so the farthest point from the ideal (1, 0) is (-1, +-1) at sqrt(5),
 and dividing by that puts the distance on [0, 1]. Whiskers are percentile
@@ -34,7 +34,7 @@ All four columns rank descending, so rank 1 always means best on that metric.
 Overall is reported after the three, never instead of them: the mean hides
 the trade-off they exist to show.
 
-Outputs:
+Outputs (CSVs in metrics/, figures in figures/<type>/):
     sens_qual_<vis>_<cost>_g<gamma>.csv           + fig_... {pdf,png}
     align_<vis>_<cost>_g<gamma>.csv               + fig_... {pdf,png}
     fig_combined_<vis>_<cost>_g<gamma>.{pdf,png}  both panels, one legend
@@ -111,8 +111,8 @@ def overall(sens, qual, align):
     return (sens + qual + align) / 3.0
 
 
-def alignment(rho_va, rho_exp):
-    return 1.0 - math.hypot(IDEAL[0] - rho_va, IDEAL[1] - rho_exp) / MAX_DIST
+def alignment(rho_rate, rho_exp):
+    return 1.0 - math.hypot(IDEAL[0] - rho_rate, IDEAL[1] - rho_exp) / MAX_DIST
 
 
 def nan_to_zero(value):
@@ -155,7 +155,7 @@ def rows_from_trajectories(visibility, cost, gamma, n_boot=2000, seed=0):
     for model, terms in terms_by_model.items():
         va_rate = level_rates(terms["va_num"], terms["va_den"])
         ex_rate = level_rates(terms["ex_num"], terms["ex_den"])
-        rho_va = -float(nan_to_zero(corr_rows(va_rate)[0]))
+        rho_rate = -float(nan_to_zero(corr_rows(va_rate)[0]))
         rho_ex = -float(nan_to_zero(corr_rows(ex_rate)[0]))
 
         sens_rows.append({
@@ -169,8 +169,8 @@ def rows_from_trajectories(visibility, cost, gamma, n_boot=2000, seed=0):
         s_rows.append({
             "model": model,
             "label": label_of.get(model, model),
-            "s_va": rho_va, "s_exp5": rho_ex,
-            "align": alignment(rho_va, rho_ex),
+            "s_rate": rho_rate, "s_exp5": rho_ex,
+            "align": alignment(rho_rate, rho_ex),
             "va_ci": cis.get(model, (None, None))[0],
             "exp_ci": cis.get(model, (None, None))[1],
         })
@@ -196,7 +196,7 @@ def write_sens_csv(rows, path):
 
 
 def write_dist_csv(rows, path):
-    fields = ["rank", "model", "s_va", "s_exp5", "align"]
+    fields = ["rank", "model", "s_rate", "s_exp5", "align"]
     has_ci = any(r.get("va_ci") or r.get("exp_ci") for r in rows)
     if has_ci:
         fields += ["s_va_ci_low", "s_va_ci_high",
@@ -286,21 +286,21 @@ def draw_s_scores(ax, rows, show_ci=True):
     for r in rows:
         col = MODEL_COLORS.get(r["model"], "#888888")
         if show_ci and (r["va_ci"] or r["exp_ci"]):
-            xerr = ([[r["s_va"] - r["va_ci"][0]], [r["va_ci"][1] - r["s_va"]]]
+            xerr = ([[r["s_rate"] - r["va_ci"][0]], [r["va_ci"][1] - r["s_rate"]]]
                     if r["va_ci"] else None)
             yerr = ([[r["s_exp5"] - r["exp_ci"][0]], [r["exp_ci"][1] - r["s_exp5"]]]
                     if r["exp_ci"] else None)
-            ax.errorbar(r["s_va"], r["s_exp5"], xerr=xerr, yerr=yerr,
+            ax.errorbar(r["s_rate"], r["s_exp5"], xerr=xerr, yerr=yerr,
                         fmt="none", ecolor=col, elinewidth=1.0, capsize=2.0,
                         capthick=1.0, alpha=0.75, zorder=3)
 
     ax.plot(*IDEAL, marker="*", ms=16, mfc=GOLD, mec=GOLD, mew=1.0,
             ls="none", zorder=2)
 
-    ax.set_xlabel(r"$\rho_{\mathrm{VA}}(\theta)$")
+    ax.set_xlabel(r"$\rho_{\mathrm{Rate}}(\theta)$")
     ax.set_ylabel(r"$\rho_{\mathrm{EXP}}(\theta)$")
 
-    xs = [r["s_va"] for r in rows] + [IDEAL[0]]
+    xs = [r["s_rate"] for r in rows] + [IDEAL[0]]
     ys = [r["s_exp5"] for r in rows] + [IDEAL[1]]
     if show_ci:
         xs += [b for r in rows if r["va_ci"] for b in r["va_ci"]]
@@ -312,7 +312,7 @@ def draw_s_scores(ax, rows, show_ci=True):
     ax.set_ylim(cy - half, cy + half)
     ax.set_aspect("equal", adjustable="box")
 
-    points = [(r["s_va"], r["s_exp5"],
+    points = [(r["s_rate"], r["s_exp5"],
                MODEL_COLORS.get(r["model"], "#888888"),
                MODEL_LABELS.get(r["model"], r["model"])) for r in rows]
     return draw_points(ax, points)
@@ -373,8 +373,8 @@ def main():
     p.add_argument("--n-boot", type=int, default=2000,
                    help="bootstrap replicates for panel B's whiskers; 0 omits them")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--outdir", default=here, type=Path,
-                   help="where the CSVs go")
+    p.add_argument("--outdir", default=here / "metrics", type=Path,
+                   help="where the CSVs go (default: metrics/)")
     p.add_argument("--figdir", default=here / "figures", type=Path,
                    help="parent of the per-figure-type folders")
     p.add_argument("--formats", nargs="+", default=["pdf", "png"])

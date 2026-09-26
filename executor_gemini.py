@@ -494,35 +494,66 @@ def build_sys_decide(budget, shuffled_questions, explore_cost, exploit_gain):
         "AVAILABLE QUESTIONS (choose exactly one if you select EXPLORE):\n"
         f"{question_list}\n\n"
         "SCORING RULES:\n\n"
-        f"  EXPLORE costs {explore_cost} points.\n"
-        f"  EXPLOIT earns +{exploit_gain} points, plus +1 per correct / -1 per wrong prediction.\n"
-        f"  Best case (4 correct): +{exploit_gain + 4}  Worst case: {exploit_gain - 4}\n\n"
+        "  Choosing EXPLORE costs points:\n"
+        f"    Your budget changes by {explore_cost} points.\n\n"
+        "  Choosing EXPLOIT earns points:\n"
+        f"    You receive +{exploit_gain} points for choosing to exploit.\n"
+        "    For each prediction:\n"
+        f"      If your prediction is correct: +{CORRECT_REWARD} point\n"
+        f"      If your prediction is incorrect: {INCORRECT_REWARD} point\n\n"
+        "  So if you exploit and predict 4 movies:\n"
+        f"    Best case  (4 correct, 0 wrong): +{exploit_gain} +4 = "
+        f"+{exploit_gain + 4} points\n"
+        f"    Worst case (0 correct, 4 wrong): +{exploit_gain} -4 = "
+        f"{exploit_gain - 4} points\n\n"
         "BUDGET RULES:\n"
-        "  Start at 10. Cannot exceed 10 or go below 0.\n"
-        f"  If budget < {abs(explore_cost)}, you must EXPLOIT.\n\n"
+        "  You start with a budget of 10 points.\n"
+        "  Your budget cannot exceed 10.\n"
+        "  Your budget cannot go below 0.\n"
+        f"  If your budget is less than {abs(explore_cost)}, you cannot\n"
+        "  choose EXPLORE and must choose EXPLOIT.\n\n"
+        "WORKED EXAMPLE:\n"
+        "  Current budget: 8\n"
+        f"  You choose EXPLORE: budget becomes 8 + ({explore_cost}) = "
+        f"{8 + explore_cost}\n"
+        "  You choose EXPLOIT and get 3 correct, 1 wrong:\n"
+        f"    budget becomes 8 + {exploit_gain} + 3 - 1 = "
+        f"{8 + exploit_gain + 3 - 1}, capped at 10.\n\n"
         "IMPORTANT RULES FOR EXPLORE:\n"
-        "  - Copy the question exactly as listed above.\n"
-        "  - Do not ask a question already asked this session.\n\n"
-        "Reply with ONLY one of:\n\n"
-        "EXPLORE\n[exact question from the list]\n\n"
-        "EXPLOIT\n[one short reason]"
+        "  - You must copy the question exactly as it appears in the list above.\n"
+        "  - You may not rephrase, shorten, or modify the question in any way.\n"
+        "  - You may not ask a question that has already been asked this session.\n"
+        "  - You may not invent a question that is not in the list.\n\n"
+        "Reply with ONLY one of these two formats, nothing before, nothing after:\n\n"
+        "EXPLORE\n"
+        "[copy the exact question from the list above]\n\n"
+        "EXPLOIT\n"
+        "[one short reason why you feel ready to predict]"
         + forced_note
     )
 
 
 def build_sys_predict():
     return (
-        "You are a movie recommendation system. Predict whether a specific user\n"
-        "will Like or Dislike each movie given to you.\n\n"
-        "Output ONLY a valid JSON object. No explanation. No markdown.\n\n"
+        "You are a movie recommendation system. Your task is to predict\n"
+        "whether a specific user will Like or Dislike each movie given to you.\n\n"
+        "Base your predictions only on the information provided about this user:\n"
+        "their demographics, their rating history, and any preferences they\n"
+        "have expressed in the Questions and Answers.\n\n"
+        "Output ONLY a valid JSON object. No explanation. No markdown.\n"
+        "No extra text before or after the JSON.\n\n"
+        "Required format:\n"
         "{\n"
         '  "predictions": [\n'
         '    {"title": "Movie Title Here", "prediction": "Like"},\n'
         '    {"title": "Another Movie",    "prediction": "Dislike"}\n'
         "  ]\n"
         "}\n\n"
-        'Use exactly "Like" or "Dislike". Include every movie. Copy titles exactly.\n'
-        "Begin your response immediately with {"
+        "Rules:\n"
+        '  - Use exactly "Like" or "Dislike" for each prediction, nothing else.\n'
+        "  - Include every movie from the input, no exceptions.\n"
+        "  - Copy each title exactly as given, character for character.\n"
+        "  - Begin your response immediately with the opening brace {"
     )
 
 
@@ -549,10 +580,8 @@ def user_msg_decide(state, turn, show_predictions):
     if has_history:
         parts.append(f"\nUser's rated movie history ({len(state.history_movies)} movies):")
         parts.append(history_block(state.history_movies))
-    if not has_demo and not has_history and not state.qa_history:
-        parts.append("\nYou have no information about this user yet.")
     if state.qa_history:
-        parts.append("\nInformation gathered so far:")
+        parts.append("\nInformation gathered so far from previous questions:")
         for i, qa in enumerate(state.qa_history, 1):
             parts.append(f"  Question {i}: {qa['question']}")
             parts.append(f"  Answer {i}: {clip(qa['answer'], 200)}")
@@ -567,7 +596,8 @@ def user_msg_decide(state, turn, show_predictions):
         )
     upcoming = state.peek_upcoming()
     if upcoming is not None:
-        parts.append("\nIf you choose EXPLOIT, these are the 4 movies you will predict:")
+        parts.append("\nIf you choose EXPLOIT this turn, these are the 4 movies "
+                     "you will be asked to predict (labels not shown):")
         parts.append(movies_block(upcoming))
     parts.append("\nWill you EXPLORE or EXPLOIT?")
     return "\n".join(parts)
@@ -582,10 +612,8 @@ def user_msg_predict(state):
     if has_history:
         parts.append(f"\nUSER RATED HISTORY ({len(state.history_movies)} movies):")
         parts.append(history_block(state.history_movies))
-    if not has_demo and not has_history and not state.qa_history:
-        parts.append("NO INFORMATION AVAILABLE ABOUT THIS USER.")
     if state.qa_history:
-        parts.append("\nUSER PREFERENCES (from Q&A):")
+        parts.append("\nUSER PREFERENCES (from Questions and Answers):")
         for qa in state.qa_history:
             parts.append(f"  Q: {qa['question']}")
             parts.append(f"  A: {clip(qa['answer'], 150)}")
@@ -766,9 +794,12 @@ def apply_decide(state, turn, text, explore_cost):
                     already_asked = [qa["question"] for qa in state.qa_history]
                     already_str   = "\n".join(f"    - {q}" for q in already_asked)
                     error_note    = (
-                        f"\n\nERROR: You chose \"{canonical_q}\" but it has already been asked.\n"
+                        f"\n\nERROR: You chose \"{canonical_q}\" but this "
+                        f"question has already been asked in this session.\n"
                         f"Questions already asked:\n{already_str}\n"
-                        f"Choose a DIFFERENT question that has NOT been asked yet."
+                        f"You must choose a DIFFERENT question from the list "
+                        f"that has NOT been asked yet. "
+                        f"Try again (attempt {retry_count + 1} of {MAX_RETRIES})."
                     )
                     retry_resp = CLIENT.models.generate_content(
                         model=MODEL_NAME,

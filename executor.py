@@ -1,8 +1,20 @@
 """
+Explore/exploit movie-preference experiment on an open-weight model (vLLM).
+See README.md for setup, the run grid, and how batching/sharding work.
+
 CLI:
+  --model           : Hugging Face model id (default meta-llama/Llama-3.1-70B-Instruct)
+  --model_dir       : results subfolder name (default: derived from --model)
   --condition       : demographics_only | context_only | demographics_context
+                      | none
   --schema          : 1 | 2
   --movie_visibility: seen | unseen
+  --tensor_parallel_size: number of GPUs to shard the model across
+  --batch_size      : users driven concurrently (1 == sequential)
+  --shard / --num_shards: split users across N processes of the same config
+  --overwrite       : re-run users that already have a summary.json
+
+Results go to rl_explore_exploit_results/<model_dir>/user_<id>/<run_tag>/.
 """
 
 import argparse
@@ -14,6 +26,8 @@ import random
 import os
 from vllm import LLM, SamplingParams
 from collections import Counter
+import io
+import contextlib
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -22,14 +36,47 @@ from collections import Counter
 parser = argparse.ArgumentParser()
 parser.add_argument("--condition",        required=True,
                     choices=["demographics_only", "context_only",
-                             "demographics_context"])
+                             "demographics_context", "none"])
 parser.add_argument("--schema",           required=True, type=int, choices=[1, 2])
 parser.add_argument("--movie_visibility", required=True, choices=["seen", "unseen"])
+parser.add_argument("--model", default="meta-llama/Llama-3.1-70B-Instruct",
+                    help="Hugging Face model id to load with vLLM.")
+parser.add_argument("--model_dir", default=None,
+                    help=("Results subfolder under rl_explore_exploit_results/. "
+                          "Defaults to a slug of --model, e.g. "
+                          "llama_3_1_70b_instruct."))
+parser.add_argument("--tensor_parallel_size", type=int,
+                    default=int(os.environ.get("TENSOR_PARALLEL_SIZE", "4")),
+                    help=("Number of visible GPUs vLLM should shard the model "
+                          "across. It must divide the model's attention "
+                          "head count (1, 2, 4 or 8 works for most models)."))
+parser.add_argument("--batch_size", type=int,
+                    default=int(os.environ.get("BATCH_SIZE", "32")),
+                    help=("Number of users driven concurrently. Their LLM\n"
+                          "calls are merged into single batched vLLM\n"
+                          "requests. 1 runs users one at a time."))
+parser.add_argument("--shard", type=int, default=0,
+                    help="This process's shard index (0-based).")
+parser.add_argument("--num_shards", type=int, default=1,
+                    help=("Split eligible users across N processes by "
+                          "round-robin so concurrent runs of the SAME "
+                          "config take disjoint users. Resume-by-skip "
+                          "alone does NOT prevent duplication, because "
+                          "in-flight users carry no completion marker."))
+parser.add_argument("--overwrite", action="store_true",
+                    help=("Re-run users that already have a completed "
+                          "summary.json for this RUN_TAG. Default is to skip "
+                          "them (resume)."))
 args = parser.parse_args()
 
 CONDITION        = args.condition
 SCHEMA           = args.schema
 MOVIE_VISIBILITY = args.movie_visibility
+TENSOR_PARALLEL_SIZE = args.tensor_parallel_size
+BATCH_SIZE           = args.batch_size
+SHARD                = args.shard
+NUM_SHARDS           = max(1, args.num_shards)
+assert 0 <= SHARD < NUM_SHARDS, "--shard must be in [0, --num_shards)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIXED CONSTANTS
@@ -54,23 +101,40 @@ N_TURNS          = 20
 MOVIES_PER_TURN  = 4
 INITIAL_BUDGET   = 10
 BUDGET_FLOOR     = 0
-MIN_MOVIES_NEEDED = 100   # exploit pool is always exactly 100 rows
+MIN_MOVIES_NEEDED = 100   # users with fewer exploit rows are skipped
 
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
-MODEL_NAME = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+MODEL_NAME = args.model
+MODEL_DIR  = args.model_dir or re.sub(
+    r"[^a-z0-9]+", "_", MODEL_NAME.split("/")[-1].lower()).strip("_")
+OUT_ROOT   = os.path.join("rl_explore_exploit_results", MODEL_DIR)
+
+# Llama-3 models keep the hand-written template below, so their prompts stay
+# identical to earlier runs. Every other model uses its tokenizer's template.
+USE_LLAMA3_TEMPLATE = MODEL_NAME.startswith("meta-llama/") and "Llama-3" in MODEL_NAME
+TOKENIZER = None
+
+# Models advertise long contexts, but the prompts here fit well within 8192.
+# A longer limit makes vLLM reserve KV cache that may not fit next to the
+# weights.
+MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "8192"))
+
+# Fraction of each GPU's memory vLLM may use for weights + KV cache. Lower it
+# if the engine runs out of memory during start-up.
+GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.94"))
 
 RUN_TAG = (
     f"schema{SCHEMA}_{CONDITION}_temp{TEMPERATURE}_{MOVIE_VISIBILITY}"
-    if CONDITION == "demographics_only"
+    if CONDITION in ("demographics_only", "none")
     else f"schema{SCHEMA}_{CONDITION}_{N_HISTORY}movies_{NATURE}"
          f"_temp{TEMPERATURE}_{MOVIE_VISIBILITY}"
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIXED QUESTION LIST
-# Shuffled once per user at the start of run_user().
+# Shuffled once per user in main() (seeded), before sharding/resume checks.
 # ─────────────────────────────────────────────────────────────────────────────
 
 QUESTIONS = [
@@ -123,6 +187,26 @@ def llama_prompt(system: str, user: str) -> str:
         "<|start_header_id|>assistant<|end_header_id|>\n\n"
     )
 
+
+def build_prompt(system: str, user: str) -> str:
+    if USE_LLAMA3_TEMPLATE:
+        return llama_prompt(system, user)
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+    try:
+        text = TOKENIZER.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        # Some templates (e.g. Gemma) reject a system role; fold it into the user turn.
+        text = TOKENIZER.apply_chat_template(
+            [{"role": "user", "content": f"{system}\n\n{user}"}],
+            tokenize=False, add_generation_prompt=True)
+    # vLLM adds BOS itself when it tokenizes the prompt.
+    bos = TOKENIZER.bos_token
+    if bos and text.startswith(bos):
+        text = text[len(bos):]
+    return text
+
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,13 +226,20 @@ def extract_demographics(movie_df):
     return age, gen, occ
 
 
-def llm_call(llm, prompt_str, sampling_params, retries=2):
+def llm_request(prompt_str, sampling_params, retries=2):
+    """Request one LLM completion from inside a run_user() coroutine.
+
+    Instead of calling the engine itself it YIELDS the work item and is
+    resumed with the generated text (or None on failure). The scheduler in
+    run_cohort() collects one such item from every in-flight user and
+    submits them as a single batched vLLM request. Up to `retries` attempts,
+    then None.
+    """
     for attempt in range(retries):
-        try:
-            out = llm.generate([prompt_str], sampling_params)
-            return out[0].outputs[0].text.strip()
-        except Exception as exc:
-            print(f"    [llm_call] attempt {attempt+1} error: {exc}")
+        response = yield (prompt_str, sampling_params)
+        if response is not None:
+            return response.strip()
+        print(f"    [llm_request] attempt {attempt+1} produced no output")
     return None
 
 
@@ -611,14 +702,14 @@ def compute_precision(details):
 FAKE_TITLES = {"The Matrix", "Gigli", "Inception", "Forrest Gump", "Pulp Fiction"}
 
 
-def do_exploit(llm, age, gender, occupation,
+def do_exploit(age, gender, occupation,
                history_movies, qa_history, movies):
-    prompt   = llama_prompt(
+    prompt   = build_prompt(
         build_sys_predict(),
         user_msg_predict(age, gender, occupation,
                          history_movies, qa_history, movies)
     )
-    response = llm_call(llm, prompt, SAMPLING_PREDICT)
+    response = yield from llm_request(prompt, SAMPLING_PREDICT)
 
     if response is None:
         print("    no LLM response")
@@ -661,25 +752,15 @@ def do_exploit(llm, age, gender, occupation,
         if pred_entry is None:
             print(f"    no match for '{movie['title']}' – defaulting to Like")
         else:
-            # this is wrong
-            # raw        = pred_entry.get("prediction", "Like").strip()
-            # prediction = "Like" if "like" in raw.lower() else "Dislike"
-            
-            
-            # one correct fix could be:
-            # raw        = pred_entry.get("prediction", "Like").strip().lower()
-            # prediction = "Dislike" if raw == "dislike" else "Like"
-            
-            # this is another correct fix
+            # exact match first; note "like" is a substring of "dislike"
             raw = pred_entry.get("prediction", "Like").strip().lower()
             if raw == "dislike":
                 prediction = "Dislike"
             elif raw == "like":
                 prediction = "Like"
             else:
-                # fallback: check if dislike appears before like
                 prediction = "Dislike" if "dislike" in raw else "Like"
-            
+
         matched.append({
             "title":      movie["title"],
             "year":       movie["year"],
@@ -692,7 +773,8 @@ def do_exploit(llm, age, gender, occupation,
 # SINGLE USER RUNNER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root):
+def run_user(user_id, exploit_pool, context_pool, simulator_data, out_root,
+             shuffled_questions):
     print(f"\n{'='*70}")
     print(f"USER {user_id}  |  {RUN_TAG}")
     print(f"{'='*70}")
@@ -700,12 +782,12 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
     age, gender, occupation = extract_demographics(exploit_pool)
     print(f"Demographics: Age={age}, Gender={gender}, Occupation={occupation}")
 
-    # ── per-user question shuffle — fixed for the whole run ───────────────────
-    shuffled_questions = QUESTIONS[:]
-    random.shuffle(shuffled_questions)
+    # NOTE: shuffled_questions is drawn by the caller (see main()) so that the
+    # global RNG stream advances once per eligible user whether or not the user
+    # is skipped on resume. Do not draw it here.
 
     # ── context history ───────────────────────────────────────────────────────
-    if CONDITION == "demographics_only":
+    if CONDITION in ("demographics_only", "none"):
         history_movies = None
         dominant_genre = "N/A"
     else:
@@ -737,8 +819,7 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
     all_prediction_rows = []
     last_batch_result   = None
     duplicate_warning   = None
-    
-    duplicate_retry_log = [] 
+    duplicate_retry_log = []
 
     for turn in range(1, N_TURNS + 1):
         print(f"\n{'─'*50}")
@@ -766,10 +847,10 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
             decision = "EXPLOIT"
             question = None
         else:
-            prompt   = llama_prompt(
+            prompt   = build_prompt(
                 build_sys_decide(budget, shuffled_questions),
                 user_msg_decide(
-                    age, gender, occupation,
+                    pred_age, pred_gender, pred_occupation,
                     history_movies, qa_history,
                     budget, turn,
                     last_batch_result,
@@ -777,7 +858,7 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
                     upcoming_movies=upcoming_movies,
                 )
             )
-            response  = llm_call(llm, prompt, SAMPLING_DECIDE)
+            response  = yield from llm_request(prompt, SAMPLING_DECIDE)
             decision, question = parse_decision(
                 response, debug_label=f"turn{turn}_decide"
             )
@@ -795,7 +876,6 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
             "forced":        forced,
         }
 
-        # ── EXPLORE ───────────────────────────────────────────────────────────
         # ── EXPLORE ───────────────────────────────────────────────────────────
         if decision == "EXPLORE":
             if not question or len(question.strip()) < 5:
@@ -871,10 +951,10 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
                             f"Try again (attempt {retry_count + 1} of {MAX_RETRIES})."
                         )
 
-                        retry_prompt = llama_prompt(
+                        retry_prompt = build_prompt(
                             build_sys_decide(budget, shuffled_questions) + error_note,
                             user_msg_decide(
-                                age, gender, occupation,
+                                pred_age, pred_gender, pred_occupation,
                                 history_movies, qa_history,
                                 budget, turn,
                                 last_batch_result,
@@ -882,7 +962,7 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
                                 upcoming_movies=upcoming_movies,
                             )
                         )
-                        retry_response = llm_call(llm, retry_prompt, SAMPLING_DECIDE)
+                        retry_response = yield from llm_request(retry_prompt, SAMPLING_DECIDE)
                         retry_decision, retry_question = parse_decision(
                             retry_response,
                             debug_label=f"turn{turn}_retry{retry_count}"
@@ -942,9 +1022,7 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
                 if resolved and decision == "EXPLORE":
                     continue
                 # Otherwise fall through to EXPLOIT block below
-        
-        
-        
+
         # ── EXPLOIT ───────────────────────────────────────────────────────────
         if decision == "EXPLOIT":
             batch_df = predict_pool.iloc[pool_idx: pool_idx + MOVIES_PER_TURN]
@@ -971,8 +1049,7 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
                     "label":  str(row["Preference"]),
                 })
 
-            preds = do_exploit(
-                llm,
+            preds = yield from do_exploit(
                 pred_age, pred_gender, pred_occupation,
                 pred_history,
                 qa_history,
@@ -1062,6 +1139,7 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
     full_log = {
         "user_id":                 int(user_id),
         "run_tag":                 RUN_TAG,
+        "model":                   MODEL_NAME,
         "condition":               CONDITION,
         "schema":                  SCHEMA,
         "movie_visibility":        MOVIE_VISIBILITY,
@@ -1085,6 +1163,7 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
         summary = {
             "user_id":                 int(user_id),
             "run_tag":                 RUN_TAG,
+        "model":                   MODEL_NAME,
             "condition":               CONDITION,
             "schema":                  SCHEMA,
             "movie_visibility":        MOVIE_VISIBILITY,
@@ -1124,6 +1203,7 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
         summary = {
             "user_id":                  int(user_id),
             "run_tag":                  RUN_TAG,
+            "model":                    MODEL_NAME,
             "condition":                CONDITION,
             "schema":                   SCHEMA,
             "movie_visibility":         MOVIE_VISIBILITY,
@@ -1171,19 +1251,81 @@ def run_user(user_id, exploit_pool, context_pool, llm, simulator_data, out_root)
         json.dump(summary, f, indent=2)
     print(f"\n  Saved → {out_dir}")
 
-def load_config(path="config.json"):
-    with open(path) as f:
-        cfg = json.load(f)
-    return cfg
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCHED SCHEDULER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_cohort(task_stream, llm, cohort_size):
+    """Drive up to `cohort_size` run_user() coroutines concurrently.
+
+    Every in-flight user is advanced until it needs the LLM. All of those
+    prompts are then submitted as ONE vLLM call, and each user is resumed with
+    its own reply. Users stay completely independent - a user only ever sees
+    its own prompts, in its own order - so batching affects only wall-clock
+    time: decode runs at batch N instead of batch 1.
+
+    Each user's stdout is captured into its own buffer and flushed as one block
+    when that user finishes, so the log stays readable per user instead of
+    interleaving N users line by line.
+    """
+    live      = []
+    processed = 0
+    exhausted = False
+
+    while True:
+        while not exhausted and len(live) < cohort_size:
+            nxt = next(task_stream, None)
+            if nxt is None:
+                exhausted = True
+                break
+            uid, gen = nxt
+            live.append({"uid": uid, "gen": gen, "buf": io.StringIO(),
+                         "send": None, "pending": None})
+
+        if not live:
+            break
+
+        # advance every in-flight user to its next LLM request
+        still = []
+        for slot in live:
+            try:
+                with contextlib.redirect_stdout(slot["buf"]):
+                    slot["pending"] = slot["gen"].send(slot["send"])
+            except StopIteration:
+                print(slot["buf"].getvalue(), end="", flush=True)
+                processed += 1
+                continue
+            except Exception as exc:
+                print(slot["buf"].getvalue(), end="")
+                print(f"\n  !! user {slot['uid']} aborted: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+                continue
+            slot["send"] = None
+            still.append(slot)
+        live = still
+
+        if not live:
+            continue
+
+        # one batched engine call for every waiting user
+        prompts = [s["pending"][0] for s in live]
+        params  = [s["pending"][1] for s in live]
+        try:
+            outs = llm.generate(prompts, params)
+        except Exception as exc:
+            print(f"    [batch] generate failed for {len(prompts)} prompts: "
+                  f"{exc}", flush=True)
+            continue   # llm_request() retries on its own
+        for slot, out in zip(live, outs):
+            slot["send"] = out.outputs[0].text if out.outputs else None
+
+    return processed
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # Set to 1 for first user only, None for all users
-    N_USERS_LIMIT = None
-
     print(f"RL EXPLORE/EXPLOIT – {RUN_TAG}")
     print(f"Schema {SCHEMA}  |  explore={EXPLORE_COST:+d}  "
           f"exploit={EXPLOIT_GAIN:+d}  temp={TEMPERATURE}")
@@ -1193,11 +1335,21 @@ def main():
           f"Budget={INITIAL_BUDGET}")
     print("=" * 70)
 
-    config = load_config()
+    os.environ.setdefault("HF_HUB_CACHE", os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "hf_models"))
 
-    os.environ["HF_HUB_CACHE"] = "/mnt/hf_models"
-    os.environ["HF_HUB_HOME"]  = "/mnt/hf_models"
-    os.environ["HF_TOKEN"]     = config.get("hf_token", "")
+    # Gated repos (e.g. meta-llama) need a valid HuggingFace token. It is read
+    # from the environment - never hardcoded here.
+    #   export HF_TOKEN=hf_...     (run_ablations.sh also sources .env / ../.env)
+    # (or rely on the token saved at ~/.cache/huggingface/token)
+    if not (os.environ.get("HF_TOKEN")
+            or os.path.exists(os.path.expanduser("~/.cache/huggingface/token"))):
+        raise SystemExit(
+            "HF_TOKEN is not set and no ~/.cache/huggingface/token exists.\n"
+            "Run:  export HF_TOKEN=hf_...   (or: huggingface-cli login)\n"
+            f"For gated models the token must belong to an account that has "
+            f"accepted the {MODEL_NAME} licence."
+        )
 
     print("Loading dataset...")
     df        = pd.read_csv("filtered_dataset_balanced.csv")
@@ -1210,48 +1362,100 @@ def main():
     print(f"  Profiles loaded: {len(simulator_data)}")
 
     print("\nLoading LLM...")
-    llm = LLM(model=MODEL_NAME, dtype="half")
-    print("Ready.\n")
+    llm = LLM(model=MODEL_NAME,
+              dtype="bfloat16",
+              tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+              max_model_len=MAX_MODEL_LEN,
+              gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+              disable_custom_all_reduce=True,
+            )
+    global TOKENIZER
+    TOKENIZER = llm.get_tokenizer()
+    print(f"Ready. {MODEL_NAME} on {TENSOR_PARALLEL_SIZE} GPU(s), "
+          f"{'Llama-3' if USE_LLAMA3_TEMPLATE else 'tokenizer'} chat template.\n")
 
-    out_root = "rl_explore_exploit_results"
+    out_root = OUT_ROOT
     os.makedirs(out_root, exist_ok=True)
+    print(f"Results: {out_root}")
 
-    skipped   = 0
-    processed = 0
+    counts = {"skipped": 0, "resumed": 0}
 
-    for user_id in all_users:
-        if N_USERS_LIMIT is not None and processed >= N_USERS_LIMIT:
-            print(f"\nReached user limit of {N_USERS_LIMIT}. Stopping.")
-            break
+    if not args.overwrite:
+        print("Resume mode ON: users with an existing summary.json for "
+              f"'{RUN_TAG}' will be skipped (use --overwrite to force re-run).")
+    print(f"Batch size: {BATCH_SIZE} users driven concurrently "
+          f"({'sequential' if BATCH_SIZE == 1 else 'batched'} mode).")
+    if NUM_SHARDS > 1:
+        print(f"Shard {SHARD} of {NUM_SHARDS}: taking every "
+              f"{NUM_SHARDS}th eligible user (disjoint from other shards).")
 
-        user_df      = df[df["UserID"] == user_id].reset_index(drop=True)
-        exploit_pool = user_df[user_df["pool"] == "exploit"].reset_index(drop=True)
-        context_pool = user_df[user_df["pool"] == "context"].reset_index(drop=True)
+    def task_stream():
+        """Yield (user_id, run_user-coroutine) for every user that must run.
 
-        if len(exploit_pool) < MIN_MOVIES_NEEDED:
-            print(f"User {user_id}: exploit pool has {len(exploit_pool)} "
-                  f"movies (need {MIN_MOVIES_NEEDED}) – skipping.")
-            skipped += 1
-            continue
+        Consumed lazily and strictly in sorted user order, so the global RNG
+        stream advances exactly as it does in a sequential run.
+        """
+        for user_id in all_users:
+            user_df      = df[df["UserID"] == user_id].reset_index(drop=True)
+            exploit_pool = user_df[user_df["pool"] == "exploit"].reset_index(drop=True)
+            context_pool = user_df[user_df["pool"] == "context"].reset_index(drop=True)
 
-        if CONDITION != "demographics_only" and len(context_pool) < N_HISTORY:
-            print(f"User {user_id}: context pool has {len(context_pool)} "
-                  f"movies (need {N_HISTORY}) – skipping.")
-            skipped += 1
-            continue
+            if len(exploit_pool) < MIN_MOVIES_NEEDED:
+                print(f"User {user_id}: exploit pool has {len(exploit_pool)} "
+                      f"movies (need {MIN_MOVIES_NEEDED}) - skipping.")
+                counts["skipped"] += 1
+                continue
 
-        if (str(user_id) not in simulator_data
-                and user_id not in simulator_data):
-            print(f"User {user_id}: no simulator profile – skipping.")
-            skipped += 1
-            continue
+            if (CONDITION not in ("demographics_only", "none")
+                    and len(context_pool) < N_HISTORY):
+                print(f"User {user_id}: context pool has {len(context_pool)} "
+                      f"movies (need {N_HISTORY}) - skipping.")
+                counts["skipped"] += 1
+                continue
 
-        run_user(user_id, exploit_pool, context_pool,
-                 llm, simulator_data, out_root)
-        processed += 1
+            if (str(user_id) not in simulator_data
+                    and user_id not in simulator_data):
+                print(f"User {user_id}: no simulator profile - skipping.")
+                counts["skipped"] += 1
+                continue
+
+            # per-user question shuffle - drawn BEFORE the resume check so the
+            # global RNG stream advances once per eligible user whether or not
+            # the user is skipped. Keeps question order paired across runs.
+            shuffled_questions = QUESTIONS[:]
+            random.shuffle(shuffled_questions)
+
+            # shard filter: placed AFTER the shuffle draw so every process
+            # advances the global RNG stream identically, and each user
+            # still gets the same question order in every shard.
+            eligible_idx[0] += 1
+            if NUM_SHARDS > 1 and (eligible_idx[0] - 1) % NUM_SHARDS != SHARD:
+                continue
+
+            # resume: summary.json is the last file run_user writes, so its
+            # presence means the user finished.
+            done_marker = os.path.join(out_root, f"user_{user_id}", RUN_TAG,
+                                       "summary.json")
+            if not args.overwrite and os.path.exists(done_marker):
+                counts["resumed"] += 1
+                if counts["resumed"] % 100 == 0 or counts["resumed"] == 1:
+                    print(f"User {user_id}: already complete - skipping "
+                          f"({counts['resumed']} so far).")
+                continue
+
+            yield user_id, run_user(user_id, exploit_pool, context_pool,
+                                    simulator_data, out_root,
+                                    shuffled_questions)
+
+    eligible_idx = [0]
+    processed = run_cohort(task_stream(), llm, max(1, BATCH_SIZE))
+    skipped   = counts["skipped"]
+    resumed   = counts["resumed"]
 
     print("\n" + "=" * 70)
-    print(f"ALL DONE.  Processed: {processed}  Skipped: {skipped}")
+    print(f"ALL DONE.  Processed: {processed}  "
+          f"Already-complete (resumed past): {resumed}  "
+          f"Ineligible: {skipped}")
     print("=" * 70)
 
 

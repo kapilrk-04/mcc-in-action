@@ -20,12 +20,12 @@
 # Set PYTHON to override the interpreter (default: python).
 #
 # Usage:
-#   bash run_ablations.sh                                  # schema 1, flash, all conditions
-#   bash run_ablations.sh --schema 2                       # schema 2
-#   bash run_ablations.sh --model pro --thinking medium    # pro with thinking
-#   bash run_ablations.sh --condition context_only         # single condition
-#   bash run_ablations.sh --poll_interval 60               # poll every 60s
-#   bash run_ablations.sh --rerun                          # rerun everything from turn 1
+#   bash run_ablations_gemini.sh                                  # schema 1, flash, all conditions
+#   bash run_ablations_gemini.sh --schema 2                       # schema 2
+#   bash run_ablations_gemini.sh --model pro --thinking medium    # pro with thinking
+#   bash run_ablations_gemini.sh --condition context_only         # single condition
+#   bash run_ablations_gemini.sh --poll_interval 60               # poll every 60s
+#   bash run_ablations_gemini.sh --rerun                          # rerun everything from turn 1
 
 set -euo pipefail
 

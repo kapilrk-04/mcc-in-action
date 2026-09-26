@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
-# Run the full 4x2x2 grid for Llama-3.1-70B-Instruct on ONE worker (shard).
+# Run the full 4x2x2 grid for one open-weight model on ONE worker (shard).
 #
 #   4 conditions x 2 schemas x 2 visibilities = 16 configs x 2038 users
 #
 # Usage:
-#   GPU_GROUPS="0,1,2,3" ./run_grid.sh 0                  # one worker
+#   GPU_GROUPS="0,1,2,3" bash run_ablations.sh 0                  # one worker
 #
-#   GPU_GROUPS="0,1,2,3 4,5,6,7" ./run_grid.sh 0          # two workers, launch
-#   GPU_GROUPS="0,1,2,3 4,5,6,7" ./run_grid.sh 1          # each in its own shell
+#   GPU_GROUPS="0,1,2,3 4,5,6,7" bash run_ablations.sh 0          # two workers, launch
+#   GPU_GROUPS="0,1,2,3 4,5,6,7" bash run_ablations.sh 1          # each in its own shell
+#
+#   MODEL=meta-llama/Llama-3.1-8B-Instruct GPU_GROUPS="0" bash run_ablations.sh 0
 #
 # GPU_GROUPS is a space-separated list of comma-separated GPU ids, one group
 # per worker. The argument picks which group this process uses, and the number
 # of groups is the number of user shards. Every worker MUST be launched with
 # the same GPU_GROUPS string, or the shards will overlap (see README.md).
 #
-# Each group's size becomes vLLM's tensor_parallel_size. Llama-3.1-70B has 64
-# attention heads and 8 KV heads, so TP must be 1, 2, 4 or 8, and the group
-# must hold the ~141 GB of bf16 weights plus KV cache.
+# Each group's size becomes vLLM's tensor_parallel_size, which must be 1, 2, 4
+# or 8, and the group must hold the model's weights plus KV cache (~141 GB of
+# bf16 weights for Llama-3.1-70B).
 #
 # Optional environment:
+#   MODEL        Hugging Face model id (default meta-llama/Llama-3.1-70B-Instruct)
 #   NUM_SHARDS   default: number of groups in GPU_GROUPS
 #   BATCH_SIZE   users driven concurrently per worker (default 64)
 #   PYTHON_BIN   interpreter with vllm + pandas installed (default python3)
 #   HF_HUB_CACHE model cache dir (default ../hf_models, same as download_model.sh)
-#   LOG_DIR      default logs_70b
+#   LOG_DIR      default logs_<model name>
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-SHARD="${1:?usage: GPU_GROUPS=\"0,1,2,3\" ./run_grid.sh <shard index into GPU_GROUPS>}"
+SHARD="${1:?usage: GPU_GROUPS=\"0,1,2,3\" bash run_ablations.sh <shard index into GPU_GROUPS>}"
+MODEL="${MODEL:-meta-llama/Llama-3.1-70B-Instruct}"
+MODEL_SLUG="$(basename "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '_')"
 
 GPU_GROUPS="${GPU_GROUPS:-0,1,2,3}"
 read -r -a GPU_GROUPS_ARR <<< "$GPU_GROUPS"
@@ -44,8 +49,7 @@ TP=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
 case "$TP" in
   1|2|4|8) ;;
   *) echo "FATAL: TP=$TP (from GPUs $CUDA_VISIBLE_DEVICES) is not usable." >&2
-     echo "       Llama-3.1-70B has 64 attention heads and 8 KV heads, so vLLM" >&2
-     echo "       requires TP in {1,2,4,8}. Use groups of 1, 2, 4 or 8 GPUs." >&2
+     echo "       Use groups of 1, 2, 4 or 8 GPUs." >&2
      exit 1 ;;
 esac
 
@@ -60,18 +64,18 @@ export VLLM_USE_FLASHINFER_SAMPLER=0 TOKENIZERS_PARALLELISM=false
 # cached, and fails if the network is down. Once the model is downloaded, run
 # offline.
 if [ -z "${HF_HUB_OFFLINE:-}" ] && \
-   ls "$HF_HUB_CACHE"/models--meta-llama--Llama-3.1-70B-Instruct/snapshots/*/config.json >/dev/null 2>&1; then
+   ls "$HF_HUB_CACHE"/models--"${MODEL//\//--}"/snapshots/*/config.json >/dev/null 2>&1; then
   export HF_HUB_OFFLINE=1
 fi
 
 # Users driven concurrently; raise it if there is spare KV cache.
 BATCH_SIZE="${BATCH_SIZE:-64}"
-LOG_DIR="${LOG_DIR:-logs_70b}"; mkdir -p "$LOG_DIR"
+LOG_DIR="${LOG_DIR:-logs_${MODEL_SLUG}}"; mkdir -p "$LOG_DIR"
 
 "$PYTHON_BIN" -c "import vllm,pandas" 2>/dev/null || {
   echo "FATAL: $PYTHON_BIN cannot import vllm/pandas (set PYTHON_BIN)" >&2; exit 1; }
 
-echo "llama-70B grid | shard $SHARD/$NUM_SHARDS | GPUs $CUDA_VISIBLE_DEVICES | TP=$TP | batch $BATCH_SIZE"
+echo "$MODEL grid | shard $SHARD/$NUM_SHARDS | GPUs $CUDA_VISIBLE_DEVICES | TP=$TP | batch $BATCH_SIZE"
 echo "HF_HUB_CACHE=$HF_HUB_CACHE  HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
 echo "16 configs, ${NUM_SHARDS}-way user sharding"
 echo
@@ -84,6 +88,7 @@ for cond in none demographics_only context_only demographics_context; do
       echo "=== [$(date '+%F %T')] start $name"
       rc=0
       "$PYTHON_BIN" executor.py \
+        --model "$MODEL" \
         --condition "$cond" --schema "$schema" --movie_visibility "$vis" \
         --tensor_parallel_size "$TP" --batch_size "$BATCH_SIZE" \
         --shard "$SHARD" --num_shards "$NUM_SHARDS" \

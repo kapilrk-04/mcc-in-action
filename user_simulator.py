@@ -28,7 +28,7 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────────────────────────────────────
 
 RANDOM_SEED  = 42
-INPUT_CSV    = "filtered_dataset_100_or_more_movies.csv"
+INPUT_CSV    = "filtered_dataset_balanced.csv"
 OUTPUT_JSON  = "user_simulator_output.json"
 
 random.seed(RANDOM_SEED)

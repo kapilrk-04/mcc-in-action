@@ -1,3 +1,13 @@
 test.py
 rl_explore_exploit_results/
 __pycache__/
+config.json
+trajectories/
+figures/
+bootstrap_with_rank/
+user_simulator_output.json
+.env
+metrics/
+logs_*/
+ablation_logs/
+in_flight_batches.jsonl
